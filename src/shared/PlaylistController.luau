@@ -55,17 +55,31 @@
 		Playlist.LoopModeChanged: (newLoopMode: string)
 ]]
 
+-- Services
 local RunService = game:GetService("RunService")
 
+-- Lightweight signal implementation
 local Signal = require(script.Signal)
 
+-- Standardized debug message format
 local DEBUG_MESSAGE_FORMAT = `[{script.Name}]: %s`
 
+-- Type definitions
+
+-- Available loop modes for the playlist
+-- None: Stops at the end of the playlist
+-- Song: Repeats the current song indefinitely
+-- Playlist: Loops the entire playlist from the beginning
 export type LoopModes = "None" | "Song" | "Playlist"
 
+-- Public Playlist interface
+-- Describes all exposed properties, methods, and events of a Playlist instance
 export type Playlist = {
+	-- Metadata (descriptive, UI-facing)
 	Name: string,
 	Playlist: { Sound },
+
+	-- Playback state
 	CurrentSong: Sound?,
 	IsActive: boolean,
 	IsPaused: boolean,
@@ -76,6 +90,7 @@ export type Playlist = {
 	ShuffleOnLoop: boolean,
 	Volume: number,
 
+	-- Public methods
 	GetQueue: (self: Playlist) -> { Sound },
 	Play: (self: Playlist) -> (),
 	Stop: (self: Playlist) -> (),
@@ -93,6 +108,7 @@ export type Playlist = {
 	SetVolume: (self: Playlist, newVolume: number) -> (),
 	Destroy: (self: Playlist) -> (),
 
+	-- Signals (events)
 	SongStarted: typeof(Signal()),
 	SongEnded: typeof(Signal()),
 	SongPaused: typeof(Signal()),
@@ -104,6 +120,7 @@ export type Playlist = {
 	LoopModeChanged: typeof(Signal()),
 }
 
+-- Since this module is intended for client use, warn if required on server
 if RunService:IsServer() then
 	warn(`[{script.Name}]: This module might not work correctly on server.`)
 end
@@ -111,16 +128,24 @@ end
 local PlaylistController = {}
 PlaylistController.__index = PlaylistController
 
--- Converts seconds into minutes and remaining seconds
+-- Utility: converts seconds into minutes and remaining seconds
 function PlaylistController.SecondsToMinute(seconds: number): number
+	-- Minutes, Seconds
 	return math.floor(seconds / 60), seconds % 60
 end
 
--- Creates a new playlist
+-- Constructor
+
+-- Creates and initializes a new Playlist instance
+-- Sets default playback state, initializes signals, and prepares internal control variables
 function PlaylistController.new(songs: { Sound }, name: string?): Playlist
 	local self = {}
+
+	-- Public playlist metadata
 	self.Name = name or "New playlist"
 	self.Playlist = table.clone(songs)
+
+	-- Playback state properties
 	self.CurrentSong = nil
 	self.IsActive = false
 	self.IsPaused = false
@@ -131,7 +156,7 @@ function PlaylistController.new(songs: { Sound }, name: string?): Playlist
 	self.SongIndex = 1
 	self.Volume = 0.5
 
-	-- Events
+	-- Signals exposed to consumers of the playlist
 	self.SongStarted = Signal()
 	self.SongEnded = Signal()
 	self.SongPaused = Signal()
@@ -142,19 +167,23 @@ function PlaylistController.new(songs: { Sound }, name: string?): Playlist
 	self.PlaylistDestroyed = Signal()
 	self.LoopModeChanged = Signal()
 
-	-- Calculate total time of all songs
+	-- Cached total duration of the playlist
+	-- Used for display purposes and external logic
 	for _, song: Sound in ipairs(songs) do
 		self.TotalTime += song.TimeLength
 	end
 
-	self._connections = {} -- Internal connections for song events
-	self._canPlay = true -- Flag to control if next song can play
-	self._originalOrder = table.clone(songs)
+	-- Internal control variables (not part of public API)
+	self._connections = {} -- Active RBXScriptConnections for song events
+	self._canPlay = true -- Prevent playback when reaching the end with no looping
+	self._originalOrder = table.clone(songs) -- Used to restore order on unshuffle
 
 	return setmetatable(self, PlaylistController)
 end
 
--- Returns the queue of upcoming songs starting from the current song
+-- Public Methods
+
+-- Returns a shallow copy of the upcoming queue
 function PlaylistController:GetQueue(): { Sound }
 	local playlist = table.clone(self.Playlist)
 	local songIndex = self.SongIndex
@@ -162,7 +191,7 @@ function PlaylistController:GetQueue(): { Sound }
 	return { unpack(playlist, songIndex) }
 end
 
--- Plays a song by index or the current song
+-- Starts playback of a given song index or resumes current index
 function PlaylistController:Play(songIndex: number?)
 	local self: Playlist = self
 	local playlist = self.Playlist
@@ -171,30 +200,30 @@ function PlaylistController:Play(songIndex: number?)
 
 	assert(playlist[index] ~= nil, string.format(DEBUG_MESSAGE_FORMAT, `Could not find song with index: {songIndex}.`))
 
+	-- Update state
 	self.SongIndex = index
-
-	local nextSong: Sound = playlist[self.SongIndex]
-
-	self.CurrentSong = nextSong
+	self.CurrentSong = playlist[index]
 	self.IsActive = true
 	self.IsPaused = false
 
-	nextSong.TimePosition = 0
-	nextSong.Volume = self.Volume
-	nextSong:Play()
+	--Configure and play the song
+	self.CurrentSong.TimePosition = 0
+	self.CurrentSong.Volume = self.Volume
+	self.CurrentSong:Play()
 
-	self.SongStarted:Fire(nextSong)
+	self.SongStarted:Fire(self.CurrentSong)
 
+	-- Rebind ended event
 	self:_disconnectEvents()
 	table.insert(
 		self._connections,
-		nextSong.Ended:Once(function(soundId: string)
+		self.CurrentSong.Ended:Once(function(_soundId: string)
 			self.SongEnded:Fire(self.CurrentSong)
 		end)
 	)
 end
 
--- Stops the current song
+-- Stops playback and resets active state
 function PlaylistController:Stop()
 	if not self.CurrentSong then
 		return
@@ -208,16 +237,18 @@ function PlaylistController:Stop()
 	self.CurrentSong = nil
 end
 
--- Shuffles the playlist while keeping the current song playing
+-- Shuffles the playlist (Fisher-Yates algorithm) and keeps current song at the front if playing
 function PlaylistController:Shuffle(onLoop: boolean)
 	local self: Playlist = self
 	local playlist = self.Playlist
 
+	-- Fisher-Yates shuffle
 	for i = #playlist, 2, -1 do
 		local j = math.random(i)
 		playlist[i], playlist[j] = playlist[j], playlist[i]
 	end
 
+	-- Keep current song at the front
 	if self.CurrentSong then
 		local currentSongIndex = table.find(playlist, self.CurrentSong)
 
@@ -228,10 +259,11 @@ function PlaylistController:Shuffle(onLoop: boolean)
 	if not onLoop then
 		self.SongIndex = 1
 	end
+
 	self.IsShuffled = true
 end
 
--- Unshuffles the playlist and reverts it to it's original order
+-- Restores the original order of the playlist
 function PlaylistController:Unshuffle()
 	local self: Playlist = self
 	local playlist = self.Playlist
@@ -256,6 +288,7 @@ end
 function PlaylistController:Next()
 	local self: Playlist = self
 
+	-- Stop current song if playing
 	if self.CurrentSong then
 		self.CurrentSong:Stop()
 		self.CurrentSong = nil
@@ -272,23 +305,23 @@ function PlaylistController:Next()
 	self:Play()
 end
 
--- Plays the previous song or restarts if > 3 seconds
+-- Plays the previous song in the playlist or restarts current if past 3 seconds
 function PlaylistController:Previous()
 	local self: Playlist = self
 	local playlist = self.Playlist
 
-	if not self.CurrentSong then
-		return
+	-- Restarts playback if past 3 seconds
+	if self.CurrentSong then
+		if self.CurrentSong.TimePosition < 3 then
+			self.CurrentSong:Stop()
+			self.CurrentSong = nil
+		else
+			self:ChangeTimePosition(0)
+			return
+		end
 	end
 
-	if self.CurrentSong.TimePosition >= 3 then
-		self:ChangeTimePosition(0)
-		return
-	end
-
-	self.CurrentSong:Stop()
-	self.CurrentSong = nil
-
+	-- If at the first song, loop to last song
 	if self.SongIndex - 1 <= 0 then
 		self.SongIndex = #playlist + 1
 	end
@@ -298,7 +331,7 @@ function PlaylistController:Previous()
 	self:Play()
 end
 
--- Pauses the current song
+-- Pauses the playback
 function PlaylistController:Pause()
 	if not self.CurrentSong then
 		return
@@ -309,7 +342,7 @@ function PlaylistController:Pause()
 	self.SongPaused:Fire()
 end
 
--- Resumes the current song
+-- Resumes the playback
 function PlaylistController:Resume()
 	if not self.CurrentSong then
 		return
@@ -320,7 +353,7 @@ function PlaylistController:Resume()
 	self.SongResumed:Fire()
 end
 
--- Swaps two songs in the playlist by their positions
+-- swaps the position of two songs in the playlist
 function PlaylistController:SwapSongPosition(i: number, j: number)
 	local playlist = self.Playlist
 
@@ -337,7 +370,7 @@ function PlaylistController:SwapSongPosition(i: number, j: number)
 	self.SongIndex = table.find(playlist, self.CurrentSong)
 end
 
--- Adds a song to the playlist
+-- Adds a song to the playlist at an optional index
 function PlaylistController:AddSong(song: Sound, index: number?): number
 	local playlist = self.Playlist
 
@@ -355,7 +388,7 @@ function PlaylistController:AddSong(song: Sound, index: number?): number
 	return table.find(playlist, song)
 end
 
--- Removes a song from the playlist by its position
+-- Removes a song from the playlist at the given index
 function PlaylistController:RemoveSong(index): Sound
 	local self: Playlist = self
 	local playlist = self.Playlist
@@ -438,15 +471,18 @@ function PlaylistController:_handleLooping()
 		return
 	end
 
+    -- If at the end of the playlist and looping is enabled, reset to start
 	if isLastSong and self.Loop == "Playlist" then
 		self.SongIndex = 0
 		self.PlaylistLooped:Fire()
 
+        -- Reshuffle if set to do so
 		if self.ShuffleOnLoop then
 			self:Shuffle(true)
 		end
 	end
 
+    -- Repeat the current song if song looping is enabled
 	if self.Loop == "Song" then
 		self.SongLooped:Fire()
 		self.SongIndex -= 1
